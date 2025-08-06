@@ -1,4 +1,4 @@
-package main
+package sessions
 
 import (
 	"database/sql"
@@ -10,46 +10,12 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb"
+	"github.com/strrl/claude-resume/internal/db"
+	"github.com/strrl/claude-resume/pkg/models"
 )
 
-type Session struct {
-	SessionID       string
-	ProjectPath     string
-	ProjectName     string
-	LastActivity    time.Time
-	RecentMessages  []string // Last 5 user messages
-}
-
-type Project struct {
-	Path         string
-	Name         string
-	SessionCount int
-	LastActivity time.Time
-	Sessions     []Session
-}
-
-
-func initializeDuckDB() (*sql.DB, error) {
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open DuckDB: %w", err)
-	}
-
-	// Install and load json extension
-	_, err = db.Exec("INSTALL json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to install json extension: %w", err)
-	}
-	_, err = db.Exec("LOAD json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to load json extension: %w", err)
-	}
-
-	return db, nil
-}
-
-func fetchProjectsWithStats() ([]Project, error) {
+// FetchProjectsWithStats fetches all projects with aggregated session statistics
+func FetchProjectsWithStats() ([]models.Project, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -58,81 +24,72 @@ func fetchProjectsWithStats() ([]Project, error) {
 	claudeDir := filepath.Join(homeDir, ".claude", "projects")
 	globPattern := filepath.Join(claudeDir, "**", "*.jsonl")
 
-	db, err := initializeDuckDB()
+	database, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	// Don't close the singleton connection
 
-	// Query to aggregate by project
-	projectQuery := fmt.Sprintf(`
-		WITH all_events AS (
-			SELECT 
-				CAST(sessionId AS VARCHAR) as sessionId,
-				COALESCE(cwd, 'Unknown') as project_path,
-				timestamp,
-				type
-			FROM read_json('%s',
-				format = 'newline_delimited',
-				union_by_name = true,
-				filename = true
-			)
-			WHERE sessionId IS NOT NULL
-		),
-		project_stats AS (
-			SELECT 
-				project_path,
-				COUNT(DISTINCT sessionId) as session_count,
-				MAX(timestamp) as last_activity,
-				COUNT(*) as total_events
-			FROM all_events
-			GROUP BY project_path
-		)
+	// Optimized query to get projects with aggregated stats
+	// Using a single pass through the data with direct aggregation
+	projectsQuery := fmt.Sprintf(`
 		SELECT 
-			project_path,
-			session_count,
-			last_activity,
-			total_events
-		FROM project_stats
-		ORDER BY last_activity DESC
+			COALESCE(cwd, 'Unknown') as project_path,
+			COUNT(DISTINCT CAST(sessionId AS VARCHAR)) as session_count,
+			MAX(timestamp) as last_activity
+		FROM read_json('%s',
+			format = 'newline_delimited',
+			union_by_name = true,
+			filename = true
+		)
+		WHERE sessionId IS NOT NULL
+		GROUP BY cwd
+		HAVING COUNT(DISTINCT CAST(sessionId AS VARCHAR)) > 0
+		ORDER BY MAX(timestamp) DESC
 		LIMIT 100
 	`, globPattern)
 
-	rows, err := db.Query(projectQuery)
+	rows, err := database.Query(projectsQuery)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute project query: %w", err)
+		return nil, fmt.Errorf("failed to execute projects query: %w", err)
 	}
 	defer rows.Close()
 
-	var projects []Project
+	var projects []models.Project
 	for rows.Next() {
-		var project Project
-		var sessionCount int
-		var totalEvents int
-		var timestampStr string
-
-		err := rows.Scan(&project.Path, &sessionCount, &timestampStr, &totalEvents)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan project row: %w", err)
-		}
-
-		project.Name = filepath.Base(project.Path)
-		if project.Name == "" || project.Name == "." {
-			project.Name = "Unknown Project"
+		var project models.Project
+		var lastActivity sql.NullString
+		
+		if err := rows.Scan(&project.Path, &project.SessionCount, &lastActivity); err != nil {
+			continue
 		}
 		
-		project.SessionCount = sessionCount
-		project.LastActivity, _ = time.Parse(time.RFC3339, timestampStr)
-		// Sessions will be loaded on demand
-		project.Sessions = nil
-
+		// Extract project name from path
+		if project.Path == "Unknown" || project.Path == "" {
+			project.Name = "Unknown"
+		} else {
+			project.Name = filepath.Base(project.Path)
+		}
+		
+		// Parse timestamp
+		if lastActivity.Valid {
+			if t, err := time.Parse(time.RFC3339, lastActivity.String); err == nil {
+				project.LastActivity = t
+			} else {
+				project.LastActivity = time.Now()
+			}
+		} else {
+			project.LastActivity = time.Now()
+		}
+		
 		projects = append(projects, project)
 	}
-
+	
 	return projects, nil
 }
 
-func fetchSessionsForProject(projectPath string) ([]Session, error) {
+// FetchSessionsForProject fetches all sessions for a specific project
+func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -141,78 +98,92 @@ func fetchSessionsForProject(projectPath string) ([]Session, error) {
 	claudeDir := filepath.Join(homeDir, ".claude", "projects")
 	globPattern := filepath.Join(claudeDir, "**", "*.jsonl")
 
-	db, err := initializeDuckDB()
+	database, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	// Don't close the singleton connection
 
-	// Query to get sessions for a specific project
-	sessionQuery := fmt.Sprintf(`
-		WITH all_events AS (
+	// Optimized query to get sessions for a specific project
+	// Direct aggregation without CTE for better performance
+	var sessionsQuery string
+	if projectPath == "Unknown" {
+		// Special case for sessions without a cwd
+		sessionsQuery = fmt.Sprintf(`
 			SELECT 
-				CAST(sessionId AS VARCHAR) as sessionId,
-				COALESCE(cwd, 'Unknown') as project_path,
-				timestamp,
-				type,
-				message
+				CAST(sessionId AS VARCHAR) as session_id,
+				MAX(timestamp) as last_activity
 			FROM read_json('%s',
 				format = 'newline_delimited',
 				union_by_name = true,
 				filename = true
 			)
 			WHERE sessionId IS NOT NULL
-			AND COALESCE(cwd, 'Unknown') = ?
-		),
-		session_stats AS (
-			SELECT 
-				sessionId,
-				MAX(timestamp) as last_activity,
-				COUNT(*) as event_count,
-				MIN(timestamp) as first_activity
-			FROM all_events
+			AND (cwd IS NULL OR cwd = '')
 			GROUP BY sessionId
-		)
-		SELECT 
-			ss.sessionId,
-			? as project_path,
-			ss.last_activity,
-			ss.first_activity,
-			ss.event_count
-		FROM session_stats ss
-		ORDER BY ss.last_activity DESC
-		LIMIT 100
-	`, globPattern)
+			ORDER BY MAX(timestamp) DESC
+			LIMIT 100
+		`, globPattern)
+	} else {
+		sessionsQuery = fmt.Sprintf(`
+			SELECT 
+				CAST(sessionId AS VARCHAR) as session_id,
+				MAX(timestamp) as last_activity
+			FROM read_json('%s',
+				format = 'newline_delimited',
+				union_by_name = true,
+				filename = true
+			)
+			WHERE sessionId IS NOT NULL
+			AND cwd = ?
+			GROUP BY sessionId
+			ORDER BY MAX(timestamp) DESC
+			LIMIT 100
+		`, globPattern)
+	}
 
-	rows, err := db.Query(sessionQuery, projectPath, projectPath)
+	var rows *sql.Rows
+	if projectPath == "Unknown" {
+		rows, err = database.Query(sessionsQuery)
+	} else {
+		rows, err = database.Query(sessionsQuery, projectPath)
+	}
+	
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute session query: %w", err)
+		return nil, fmt.Errorf("failed to execute sessions query: %w", err)
 	}
 	defer rows.Close()
 
-	var sessions []Session
+	var sessions []models.Session
 	for rows.Next() {
-		var session Session
-		var timestampStr string
-		var firstActivityStr string
-		var eventCount int
-
-		err := rows.Scan(&session.SessionID, &session.ProjectPath, &timestampStr, &firstActivityStr, &eventCount)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan session row: %w", err)
+		var session models.Session
+		var lastActivity sql.NullString
+		
+		if err := rows.Scan(&session.SessionID, &lastActivity); err != nil {
+			continue
 		}
-
-		session.LastActivity, _ = time.Parse(time.RFC3339, timestampStr)
-		session.ProjectName = filepath.Base(projectPath)
-
+		
+		session.ProjectPath = projectPath
+		
+		// Parse timestamp
+		if lastActivity.Valid {
+			if t, err := time.Parse(time.RFC3339, lastActivity.String); err == nil {
+				session.LastActivity = t
+			} else {
+				session.LastActivity = time.Now()
+			}
+		} else {
+			session.LastActivity = time.Now()
+		}
+		
 		sessions = append(sessions, session)
 	}
-
+	
 	return sessions, nil
 }
 
-
-func fetchRecentMessagesForSession(sessionID string) ([]string, error) {
+// FetchRecentMessagesForSession fetches the last 5 user text messages for a session
+func FetchRecentMessagesForSession(sessionID string) ([]string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -221,20 +192,22 @@ func fetchRecentMessagesForSession(sessionID string) ([]string, error) {
 	claudeDir := filepath.Join(homeDir, ".claude", "projects")
 	globPattern := filepath.Join(claudeDir, "**", "*.jsonl")
 
-	db, err := initializeDuckDB()
+	database, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	// Don't close the singleton connection
 
-	// Query to get last 5 user TEXT messages (not tool results) for a specific session
-	// We need to filter at the SQL level to avoid getting only tool results
+	// Optimized SQL query:
+	// 1. Filter by sessionId and type='user' at the database level
+	// 2. Order by timestamp to get most recent messages
+	// 3. Use a subquery to reverse order for final output
+	// 4. Fetch more than 5 to account for tool results, but limit to reasonable amount
 	messagesQuery := fmt.Sprintf(`
-		WITH all_user_messages AS (
+		SELECT message_json FROM (
 			SELECT 
 				to_json(message) as message_json,
-				timestamp,
-				type
+				timestamp
 			FROM read_json('%s',
 				format = 'newline_delimited',
 				union_by_name = true,
@@ -244,14 +217,12 @@ func fetchRecentMessagesForSession(sessionID string) ([]string, error) {
 			AND type = 'user'
 			AND message IS NOT NULL
 			ORDER BY timestamp DESC
-			LIMIT 50
-		)
-		SELECT message_json
-		FROM all_user_messages
+			LIMIT 30
+		) AS recent_messages
 		ORDER BY timestamp ASC
 	`, globPattern)
 
-	rows, err := db.Query(messagesQuery, sessionID)
+	rows, err := database.Query(messagesQuery, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute messages query: %w", err)
 	}
@@ -265,7 +236,7 @@ func fetchRecentMessagesForSession(sessionID string) ([]string, error) {
 		}
 		
 		if messageJSON.Valid && messageJSON.String != "" {
-			// Extract content from the message JSON
+			// Extract content from the message JSON in Go
 			content := extractMessageContent(messageJSON.String)
 			// Add the extracted content only if it's actual user text
 			if content != "" {
@@ -278,15 +249,10 @@ func fetchRecentMessagesForSession(sessionID string) ([]string, error) {
 		}
 	}
 
-	// Reverse the messages to show oldest first (since we queried DESC but want to display ASC)
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
-
 	return messages, nil
 }
 
-// Helper function to extract content from Claude message format
+// extractMessageContent extracts text content from Claude message format
 func extractMessageContent(messageStr string) string {
 	// First, check if it's a JSON string that needs to be unescaped
 	if strings.HasPrefix(messageStr, `"`) && strings.HasSuffix(messageStr, `"`) {
@@ -370,7 +336,8 @@ func extractMessageContent(messageStr string) string {
 	return ""
 }
 
-func executeClaudeResume(sessionID string, projectPath string) error {
+// ExecuteClaudeResume changes to project directory and executes claude --resume
+func ExecuteClaudeResume(sessionID string, projectPath string) error {
 	// Change to project directory first
 	if projectPath != "" && projectPath != "Unknown" {
 		if err := os.Chdir(projectPath); err != nil {
@@ -385,7 +352,8 @@ func executeClaudeResume(sessionID string, projectPath string) error {
 	return cmd.Run()
 }
 
-func debugSessionMessages(sessionID string) ([]string, error) {
+// DebugSessionMessages returns debug information about messages in a session
+func DebugSessionMessages(sessionID string) ([]string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -394,11 +362,11 @@ func debugSessionMessages(sessionID string) ([]string, error) {
 	claudeDir := filepath.Join(homeDir, ".claude", "projects")
 	globPattern := filepath.Join(claudeDir, "**", "*.jsonl")
 
-	db, err := initializeDuckDB()
+	database, err := db.GetDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	// Don't close the singleton connection
 
 	// First, let's find any actual user text messages
 	textQuery := fmt.Sprintf(`
@@ -416,7 +384,7 @@ func debugSessionMessages(sessionID string) ([]string, error) {
 		ORDER BY timestamp ASC
 	`, globPattern)
 
-	rows, err := db.Query(textQuery, sessionID)
+	rows, err := database.Query(textQuery, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute debug query: %w", err)
 	}

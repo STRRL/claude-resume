@@ -8,11 +8,14 @@ claude-resume is a Go-based TUI (Terminal User Interface) application that allow
 
 ## Architecture
 
-The application follows a clean separation of concerns with three main components:
+The application follows the Go standard project layout with a clean separation of concerns:
 
-1. **main.go** - Entry point that orchestrates the flow: fetch projects → show TUI → execute claude resume
-2. **sessions.go** - Handles all DuckDB queries and data operations for fetching projects and sessions from Claude's JSONL files
-3. **tui.go** - Implements the Bubble Tea-based terminal UI with split-screen session view
+### Directory Structure
+- **cmd/claude-resume/** - Application entry point and CLI commands
+- **internal/sessions/** - DuckDB queries and data operations for fetching projects and sessions
+- **internal/tui/** - Bubble Tea-based terminal UI implementation
+- **internal/db/** - Database initialization and connection management
+- **pkg/models/** - Shared data models (Project, Session)
 
 ### Data Flow
 
@@ -20,6 +23,14 @@ The application follows a clean separation of concerns with three main component
 2. Projects are fetched first with aggregated statistics (session count, last activity)
 3. Sessions are lazily loaded only when a project is selected
 4. When a session is selected, the app changes to the project directory and executes `claude --resume <session-id>`
+
+### Key Components
+
+- **cmd/claude-resume/main.go**: CLI commands using Cobra (show, debug-session)
+- **internal/sessions/sessions.go**: Core data fetching logic with SQL queries
+- **internal/tui/tui.go**: Interactive terminal UI with viewport support
+- **internal/db/duckdb.go**: DuckDB initialization with JSON extension
+- **pkg/models/models.go**: Shared Project and Session structs
 
 ### Key SQL Patterns
 

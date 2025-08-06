@@ -1,10 +1,10 @@
 .PHONY: build install clean test run
 
 build:
-	go build -o claude-resume
+	go build -o claude-resume ./cmd/claude-resume
 
-install: build
-	go install
+install:
+	go install ./cmd/claude-resume
 
 clean:
 	rm -f claude-resume

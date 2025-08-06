@@ -6,7 +6,7 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
-            "program": "${workspaceFolder}",
+            "program": "${workspaceFolder}/cmd/claude-resume",
             "console": "integratedTerminal",
             "env": {},
             "args": []
@@ -16,7 +16,7 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
-            "program": "${workspaceFolder}",
+            "program": "${workspaceFolder}/cmd/claude-resume",
             "console": "internalConsole",
             "env": {},
             "args": ["--debug"]
@@ -26,7 +26,7 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
-            "program": "${workspaceFolder}",
+            "program": "${workspaceFolder}/cmd/claude-resume",
             "console": "externalTerminal",
             "env": {},
             "args": []
