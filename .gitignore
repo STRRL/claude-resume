@@ -31,5 +31,5 @@ go.work.sum
 # .idea/
 # .vscode/
 
-claude-resume
+/claude-resume
 dist/
