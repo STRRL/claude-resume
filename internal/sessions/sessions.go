@@ -425,7 +425,28 @@ func ExecuteClaudeResume(sessionID string, projectPath string) error {
 		}
 	}
 	
-	cmd := exec.Command("claude", "--resume", sessionID)
+	// Try to find claude executable
+	claudePath := "claude"
+	
+	// Check if claude is in PATH
+	if _, err := exec.LookPath("claude"); err != nil {
+		// Check common installation locations
+		homeDir, _ := os.UserHomeDir()
+		possiblePaths := []string{
+			filepath.Join(homeDir, ".claude", "local", "claude"),
+			"/usr/local/bin/claude",
+			"/opt/homebrew/bin/claude",
+		}
+		
+		for _, path := range possiblePaths {
+			if _, err := os.Stat(path); err == nil {
+				claudePath = path
+				break
+			}
+		}
+	}
+	
+	cmd := exec.Command(claudePath, "--resume", sessionID)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
