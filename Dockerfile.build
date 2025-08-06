@@ -1,5 +1,5 @@
 # Multi-stage builder for cross-platform builds
-FROM golang:1.23-bookworm AS builder-base
+FROM golang:1.24-bookworm AS builder-base
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
