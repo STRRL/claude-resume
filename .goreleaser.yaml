@@ -5,28 +5,12 @@ before:
     - go mod tidy
 
 builds:
-  # macOS builds
-  - id: claude-resume-darwin
-    main: ./cmd/claude-resume/
-    binary: claude-resume
-    env:
-      - CGO_ENABLED=1
-    goos:
-      - darwin
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w
-  
   # Linux AMD64 builds
   - id: claude-resume-linux-amd64
     main: ./cmd/claude-resume/
     binary: claude-resume
     env:
       - CGO_ENABLED=1
-      - CC=x86_64-linux-gnu-gcc
-      - CXX=x86_64-linux-gnu-g++
     goos:
       - linux
     goarch:
