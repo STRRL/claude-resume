@@ -6,7 +6,7 @@ before:
 
 builds:
   - id: claude-resume
-    main: ./cmd/claude-resume
+    main: ./cmd/claude-resume/
     binary: claude-resume
     env:
       - CGO_ENABLED=1
