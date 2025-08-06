@@ -2,6 +2,8 @@
 
 An interactive TUI (Terminal User Interface) tool for browsing and resuming Claude Code sessions with a sophisticated split-screen interface and real-time conversation preview.
 
+![Screenshot](./static/Screenshot%202025-08-05%20at%2023.18.48.png)
+
 ## Features
 
 - **Project Browser**: View all projects with Claude Code sessions, session counts, and last activity timestamps
