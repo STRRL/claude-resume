@@ -38,22 +38,21 @@ func Execute() {
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
-	projects, err := sessions.FetchProjectsWithStats()
-	if err != nil {
-		return fmt.Errorf("failed to fetch projects: %w", err)
-	}
-
-	if len(projects) == 0 {
-		fmt.Println("No projects found")
-		return nil
-	}
-
-	// Debug mode: just list projects and sessions without TUI
+	// In debug mode, we need to fetch projects synchronously
 	if debugMode {
+		projects, err := sessions.FetchProjectsWithStats()
+		if err != nil {
+			return fmt.Errorf("failed to fetch projects: %w", err)
+		}
+		if len(projects) == 0 {
+			fmt.Println("No projects found")
+			return nil
+		}
 		return runDebugMode(projects)
 	}
 
-	selectedSession, err := tui.ShowTUI(projects)
+	// For normal TUI mode, start with empty projects and load async
+	selectedSession, err := tui.ShowTUI(nil) // Pass nil to indicate async loading
 	if err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}

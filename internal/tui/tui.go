@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -33,26 +34,179 @@ type model struct {
 	err             error
 	width           int
 	height          int
+	
+	// Loading state management
+	loadingState    sessions.LoadingState
+	loadingIndicator *LoadingIndicator
+	activeRequests  map[string]context.CancelFunc
+	ctx             context.Context
+	cancel          context.CancelFunc
+	
+	// Message cache: sessionID -> messages
+	messageCache    map[string][]string
+	loadingMessages map[string]bool  // Track which sessions are currently loading
+	
+	// Initial command to run on startup
+	initialCmd tea.Cmd
 }
 
 func initialModel(projects []models.Project) model {
+	ctx, cancel := context.WithCancel(context.Background())
 	return model{
 		projects:      projects,
 		currentMode:   projectView,
 		projectCursor: 0,
 		sessionCursor: 0,
+		loadingState:  sessions.StateIdle,
+		loadingIndicator: NewLoadingIndicator("Loading..."),
+		activeRequests: make(map[string]context.CancelFunc),
+		ctx:           ctx,
+		cancel:        cancel,
+		messageCache:  make(map[string][]string),
+		loadingMessages: make(map[string]bool),
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	// Return a command to get the window size
-	return tea.EnterAltScreen
+	// Return commands to initialize the view and start ticker
+	cmds := []tea.Cmd{
+		tea.EnterAltScreen,
+	}
+	
+	// If we have an initial command (for async loading), include it
+	if m.initialCmd != nil {
+		cmds = append(cmds, m.initialCmd)
+	} else {
+		cmds = append(cmds, tickCmd())
+	}
+	
+	return tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case TickMsg:
+		// Update spinner animation for any loading state
+		if m.loadingState != sessions.StateIdle || len(m.loadingMessages) > 0 {
+			m.loadingIndicator.Tick()
+			m.updateViewport() // Update viewport to show spinner animation
+			cmds = append(cmds, tickCmd())
+		}
+		return m, tea.Batch(cmds...)
+	
+	case ProjectsLoadedMsg:
+		m.loadingState = sessions.StateIdle
+		if msg.Error != nil {
+			m.err = msg.Error
+		} else {
+			m.projects = msg.Projects
+			m.updateViewport()
+		}
+		return m, nil
+	
+	case SessionsLoadedMsg:
+		if msg.Error != nil {
+			m.loadingState = sessions.StateIdle
+			m.err = msg.Error
+		} else if m.selectedProject != nil {
+			m.selectedProject.Sessions = msg.Sessions
+			m.currentMode = sessionView
+			m.sessionCursor = 0
+			m.loadingState = sessions.StateIdle // Sessions loaded, set to idle first
+			m.updateViewport() // Update the view to show sessions
+			
+			// Load summaries for all sessions asynchronously
+			if len(msg.Sessions) > 0 {
+				sessionIDs := make([]string, len(msg.Sessions))
+				for i, session := range msg.Sessions {
+					sessionIDs[i] = session.SessionID
+				}
+				
+				// Load summaries in background
+				ctx, cancel := context.WithCancel(m.ctx)
+				m.activeRequests["summaries"] = cancel
+				cmds = append(cmds, loadSummariesCmd(ctx, m.selectedProject.Path, sessionIDs))
+			}
+			
+			// Load messages for the first session
+			if len(msg.Sessions) > 0 {
+				session := msg.Sessions[0]
+				// Check cache first
+				if cached, ok := m.messageCache[session.SessionID]; ok {
+					m.currentMessages = cached
+				} else {
+					m.currentMessages = []string{} // Clear messages while loading
+					m.loadingState = sessions.StateLoadingMessages
+					m.loadingMessages[session.SessionID] = true
+					m.loadingIndicator.SetMessage("Loading messages...")
+					
+					ctx, cancel := context.WithCancel(m.ctx)
+					m.activeRequests["messages-"+session.SessionID] = cancel
+					
+					cmds = append(cmds, loadMessagesCmd(ctx, session.SessionID))
+					cmds = append(cmds, tickCmd())
+				}
+			}
+		}
+		return m, tea.Batch(cmds...)
+	
+	case SummariesLoadedMsg:
+		// Update session summaries when they arrive
+		if msg.Error == nil && m.selectedProject != nil {
+			// Update summaries for matching sessions
+			for i := range m.selectedProject.Sessions {
+				if summary, ok := msg.Summaries[m.selectedProject.Sessions[i].SessionID]; ok {
+					m.selectedProject.Sessions[i].Summary = summary
+				}
+			}
+			// Update the viewport to show the summaries
+			m.updateViewport()
+		}
+		return m, nil
+	
+	case MessagesLoadedMsg:
+		// Mark this session as no longer loading
+		if msg.SessionID != "" {
+			delete(m.loadingMessages, msg.SessionID)
+		}
+		
+		// Cache the messages
+		if msg.Error == nil {
+			if len(msg.Messages) == 0 {
+				m.messageCache[msg.SessionID] = []string{"No messages found for this session"}
+			} else {
+				m.messageCache[msg.SessionID] = msg.Messages
+			}
+			
+			// Always update current messages if this is the selected session
+			// Check if this is still the currently selected session
+			if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions) {
+				currentSession := m.selectedProject.Sessions[m.sessionCursor]
+				if currentSession.SessionID == msg.SessionID {
+					// This is the current session, update the messages
+					m.currentMessages = m.messageCache[msg.SessionID]
+				}
+			}
+		} else {
+			// On error, show error message if this is still the selected session
+			if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions) {
+				currentSession := m.selectedProject.Sessions[m.sessionCursor]
+				if currentSession.SessionID == msg.SessionID {
+					m.currentMessages = []string{fmt.Sprintf("Error loading messages: %v", msg.Error)}
+				}
+			}
+		}
+		
+		// Check if any messages are still loading
+		if len(m.loadingMessages) == 0 {
+			m.loadingState = sessions.StateIdle
+		}
+		
+		m.updateViewport()
+		return m, nil
+	
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -89,8 +243,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		// Handle ESC for cancellation when loading
+		if msg.String() == "esc" && m.loadingState != sessions.StateIdle {
+			// Cancel current operation
+			for _, cancel := range m.activeRequests {
+				cancel()
+			}
+			m.activeRequests = make(map[string]context.CancelFunc)
+			m.loadingState = sessions.StateIdle
+			m.loadingIndicator.SetMessage("Cancelled")
+			return m, nil
+		}
+		
+		// Block navigation when loading
+		if m.loadingState != sessions.StateIdle {
+			return m, nil
+		}
+		
 		switch msg.String() {
 		case "ctrl+c", "q":
+			m.cancel() // Cancel context on quit
 			return m, tea.Quit
 
 		case "up", "k":
@@ -102,8 +274,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if m.sessionCursor > 0 {
 					m.sessionCursor--
-					m.loadCurrentSessionMessages()
-					m.updateViewport()
+					session := m.selectedProject.Sessions[m.sessionCursor]
+					
+					// Cancel any existing message fetch for previous session
+					for key, cancel := range m.activeRequests {
+						if strings.HasPrefix(key, "messages-") {
+							cancel()
+							delete(m.activeRequests, key)
+						}
+					}
+					
+					// Check cache first
+					if cached, ok := m.messageCache[session.SessionID]; ok {
+						m.currentMessages = cached
+						m.loadingState = sessions.StateIdle
+						m.updateViewport()
+					} else {
+						// Load messages asynchronously
+						m.currentMessages = []string{} // Clear current messages
+						m.loadingState = sessions.StateLoadingMessages
+						m.loadingMessages[session.SessionID] = true
+						m.loadingIndicator.SetMessage("Loading messages...")
+						
+						ctx, cancel := context.WithCancel(m.ctx)
+						m.activeRequests["messages-"+session.SessionID] = cancel
+						
+						cmds = append(cmds, loadMessagesCmd(ctx, session.SessionID))
+						cmds = append(cmds, tickCmd())
+						m.updateViewport()
+						return m, tea.Batch(cmds...)
+					}
 				}
 			}
 
@@ -116,33 +316,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions)-1 {
 					m.sessionCursor++
-					m.loadCurrentSessionMessages()
-					m.updateViewport()
+					session := m.selectedProject.Sessions[m.sessionCursor]
+					
+					// Cancel any existing message fetch for previous session
+					for key, cancel := range m.activeRequests {
+						if strings.HasPrefix(key, "messages-") {
+							cancel()
+							delete(m.activeRequests, key)
+						}
+					}
+					
+					// Check cache first
+					if cached, ok := m.messageCache[session.SessionID]; ok {
+						m.currentMessages = cached
+						m.loadingState = sessions.StateIdle
+						m.updateViewport()
+					} else {
+						// Load messages asynchronously
+						m.currentMessages = []string{} // Clear current messages
+						m.loadingState = sessions.StateLoadingMessages
+						m.loadingMessages[session.SessionID] = true
+						m.loadingIndicator.SetMessage("Loading messages...")
+						
+						ctx, cancel := context.WithCancel(m.ctx)
+						m.activeRequests["messages-"+session.SessionID] = cancel
+						
+						cmds = append(cmds, loadMessagesCmd(ctx, session.SessionID))
+						cmds = append(cmds, tickCmd())
+						m.updateViewport()
+						return m, tea.Batch(cmds...)
+					}
 				}
 			}
 
 		case "enter":
 			if m.currentMode == projectView {
-				// Load sessions for the selected project
+				// Load sessions for the selected project asynchronously
 				if m.projectCursor < len(m.projects) {
 					project := m.projects[m.projectCursor]
-					projectSessions, err := sessions.FetchSessionsForProject(project.Path)
-					if err != nil {
-						m.err = err
-						return m, nil
-					}
-					project.Sessions = projectSessions
+					project.Sessions = []models.Session{} // Initialize empty sessions slice
 					m.selectedProject = &project
-					m.currentMode = sessionView
+					m.currentMode = sessionView // Switch to session view immediately
 					m.sessionCursor = 0
-					// Load messages for the first session
-					m.loadCurrentSessionMessages()
-					m.updateViewport()
+					m.currentMessages = []string{} // Clear messages
+					m.loadingState = sessions.StateLoadingSessions
+					m.loadingIndicator.SetMessage("Loading sessions...")
+					m.updateViewport() // Update view to show split screen with loading
+					
+					// Create cancellable context for this operation
+					ctx, cancel := context.WithCancel(m.ctx)
+					m.activeRequests["sessions"] = cancel
+					
+					cmds = append(cmds, loadSessionsCmd(ctx, project.Path))
+					cmds = append(cmds, tickCmd())
+					return m, tea.Batch(cmds...)
 				}
 			} else {
 				// Select session to resume
 				if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions) {
 					m.selectedSession = &m.selectedProject.Sessions[m.sessionCursor]
+					m.cancel() // Cancel context before quitting
 					return m, tea.Quit
 				}
 			}
@@ -186,28 +419,8 @@ func (m *model) updateViewport() {
 	}
 }
 
-func (m *model) loadCurrentSessionMessages() {
-	if m.selectedProject == nil || m.sessionCursor >= len(m.selectedProject.Sessions) {
-		m.currentMessages = []string{}
-		m.selectedSession = nil
-		return
-	}
-	
-	session := m.selectedProject.Sessions[m.sessionCursor]
-	// Fetch summary for this session if not already loaded
-	if session.Summary == "" {
-		session.Summary = sessions.FetchSummaryForSession(session.SessionID)
-	}
-	m.selectedSession = &session
-	messages, err := sessions.FetchRecentMessagesForSession(session.SessionID)
-	if err != nil {
-		m.currentMessages = []string{fmt.Sprintf("Error loading messages: %v", err)}
-	} else if len(messages) == 0 {
-		m.currentMessages = []string{"No messages found for this session"}
-	} else {
-		m.currentMessages = messages
-	}
-}
+// loadCurrentSessionMessages is now replaced by async loading
+// Kept for reference but not used
 
 func (m model) renderContent() string {
 	if m.currentMode == projectView {
@@ -261,6 +474,22 @@ func (m model) renderSessionsList() string {
 		Foreground(lipgloss.Color("229"))
 	s.WriteString(headerStyle.Render("Sessions") + "\n")
 	s.WriteString(strings.Repeat("─", m.leftViewport.Width-2) + "\n\n")
+	
+	// Show loading state for sessions
+	if m.loadingState == sessions.StateLoadingSessions {
+		loadingStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("212"))
+		s.WriteString(loadingStyle.Render(m.loadingIndicator.View()))
+		return s.String()
+	}
+	
+	if m.selectedProject.Sessions == nil || len(m.selectedProject.Sessions) == 0 {
+		emptyStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Italic(true)
+		s.WriteString(emptyStyle.Render("No sessions found"))
+		return s.String()
+	}
 	
 	for i, session := range m.selectedProject.Sessions {
 		cursor := "  "
@@ -352,6 +581,30 @@ func (m model) renderMessages() string {
 		dividerWidth = 10
 	}
 	s.WriteString(strings.Repeat("─", dividerWidth) + "\n\n")
+	
+	// Check if current session is loading messages
+	var isLoadingCurrentSession bool
+	if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions) {
+		currentSession := m.selectedProject.Sessions[m.sessionCursor]
+		isLoadingCurrentSession = m.loadingMessages[currentSession.SessionID]
+	}
+	
+	// Show loading state for messages
+	if isLoadingCurrentSession {
+		loadingStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("212"))
+		s.WriteString(loadingStyle.Render(m.loadingIndicator.View()))
+		return s.String()
+	}
+	
+	// If sessions are still loading, show a placeholder
+	if m.loadingState == sessions.StateLoadingSessions {
+		emptyStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Italic(true)
+		s.WriteString(emptyStyle.Render("Select a session to view messages"))
+		return s.String()
+	}
 	
 	if len(m.currentMessages) == 0 {
 		emptyStyle := lipgloss.NewStyle().
@@ -484,10 +737,16 @@ func (m model) View() string {
 	header := m.renderHeader()
 	footer := m.renderFooter()
 	
+	// Show loading overlay only for projects loading
+	if m.loadingState == sessions.StateLoadingProjects {
+		loadingView := LoadingOverlay(m.width, m.height-2, m.loadingIndicator)
+		return fmt.Sprintf("%s\n%s\n%s", header, loadingView, footer)
+	}
+	
 	if m.currentMode == projectView {
 		return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), footer)
 	} else {
-		// Split screen view for sessions
+		// Split screen view for sessions (loading states handled in panels)
 		return fmt.Sprintf("%s\n%s\n%s", header, m.renderSplitView(), footer)
 	}
 }
@@ -542,11 +801,17 @@ func (m model) renderHeader() string {
 }
 
 func (m model) renderFooter() string {
-	info := "↑/↓: navigate • enter: select"
-	if m.currentMode == sessionView {
-		info += " • esc: back"
+	var info string
+	
+	if m.loadingState != sessions.StateIdle {
+		info = "ESC: cancel • q: quit"
+	} else {
+		info = "↑/↓: navigate • enter: select"
+		if m.currentMode == sessionView {
+			info += " • esc: back"
+		}
+		info += " • q: quit"
 	}
-	info += " • q: quit"
 	
 	style := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241"))
@@ -557,8 +822,21 @@ func (m model) renderFooter() string {
 
 // ShowTUI displays the TUI and returns the selected session
 func ShowTUI(projects []models.Project) (*models.Session, error) {
+	m := initialModel(projects)
+	
+	// If projects is nil, we need to load them async
+	if projects == nil {
+		m.projects = []models.Project{} // Initialize empty
+		m.loadingState = sessions.StateLoadingProjects
+		m.loadingIndicator.SetMessage("Loading projects...")
+		m.initialCmd = tea.Batch(
+			loadProjectsCmd(m.ctx),
+			tickCmd(),
+		)
+	}
+	
 	p := tea.NewProgram(
-		initialModel(projects),
+		m,
 		tea.WithAltScreen(),
 	)
 
@@ -567,6 +845,6 @@ func ShowTUI(projects []models.Project) (*models.Session, error) {
 		return nil, err
 	}
 
-	m := finalModel.(model)
-	return m.selectedSession, nil
+	model := finalModel.(model)
+	return model.selectedSession, nil
 }
