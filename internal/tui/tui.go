@@ -515,12 +515,6 @@ func (m model) renderFooter() string {
 	return style.Render(info)
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
 
 // ShowTUI displays the TUI and returns the selected session
 func ShowTUI(projects []models.Project) (*models.Session, error) {

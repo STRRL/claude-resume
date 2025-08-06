@@ -46,8 +46,3 @@ func initializeDuckDB() (*sql.DB, error) {
 
 	return db, nil
 }
-
-// InitializeDuckDB is kept for backward compatibility but uses singleton
-func InitializeDuckDB() (*sql.DB, error) {
-	return GetDB()
-}
