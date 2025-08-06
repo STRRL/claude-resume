@@ -16,6 +16,16 @@ An interactive TUI (Terminal User Interface) tool for browsing and resuming Clau
 
 ## Installation
 
+### Quick Start with Homebrew
+
+```bash
+# Add this tap to your Homebrew
+brew tap strrl/collective
+
+# Install packages
+brew install claude-resume
+```
+
 ### From source
 
 ```bash
