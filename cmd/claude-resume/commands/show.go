@@ -54,7 +54,7 @@ func showProjects() error {
 		fmt.Printf("%d. %s\n", i+1, project.Name)
 		fmt.Printf("   Path: %s\n", project.Path)
 		fmt.Printf("   Sessions: %d\n", project.SessionCount)
-		fmt.Printf("   Last Activity: %s\n", project.LastActivity.Format("2006-01-02 15:04"))
+		fmt.Printf("   Last Activity: %s\n", project.LastActivity.Format("Jan 02 15:04 MST"))
 		fmt.Println()
 	}
 	
@@ -98,7 +98,7 @@ func showSessions(projectName string) error {
 	
 	for i, session := range projectSessions {
 		fmt.Printf("%d. Session ID: %s\n", i+1, session.SessionID)
-		fmt.Printf("   Last Activity: %s\n", session.LastActivity.Format("2006-01-02 15:04"))
+		fmt.Printf("   Last Activity: %s\n", session.LastActivity.Format("Jan 02 15:04 MST"))
 		
 		// Fetch and show recent messages
 		messages, err := sessions.FetchRecentMessagesForSession(session.SessionID)
@@ -160,7 +160,7 @@ func showMessages(projectName, sessionID string) error {
 				fmt.Printf("... and %d more sessions\n", len(projectSessions)-10)
 				break
 			}
-			fmt.Printf("  - %s (Last activity: %s)\n", session.SessionID, session.LastActivity.Format("2006-01-02 15:04"))
+			fmt.Printf("  - %s (Last activity: %s)\n", session.SessionID, session.LastActivity.Format("Jan 02 15:04 MST"))
 		}
 		return nil
 	}

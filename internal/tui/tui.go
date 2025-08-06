@@ -234,7 +234,7 @@ func (m model) renderProjects() string {
 			cursor,
 			project.Name,
 			project.SessionCount,
-			project.LastActivity.Format("2006-01-02 15:04"))
+			project.LastActivity.Format("Jan 02 15:04"))
 		
 		s.WriteString(style.Render(line) + "\n")
 	}
@@ -311,7 +311,7 @@ func (m model) renderSessionsList() string {
 			dateStyle = dateStyle.Foreground(lipgloss.Color("240"))
 		}
 		
-		dateLine := fmt.Sprintf("  Last Active: %s", session.LastActivity.Format("01-02 15:04"))
+		dateLine := fmt.Sprintf("  Last Active: %s", session.LastActivity.Format("Jan 02 15:04 MST"))
 		s.WriteString(dateStyle.Render(dateLine) + "\n")
 		
 		// Session ID (smaller, tertiary info)

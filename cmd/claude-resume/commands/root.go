@@ -71,7 +71,7 @@ func runDebugMode(projects []models.Project) error {
 		fmt.Printf("\n%d. Project: %s\n", i+1, project.Name)
 		fmt.Printf("   Path: %s\n", project.Path)
 		fmt.Printf("   Sessions: %d\n", project.SessionCount)
-		fmt.Printf("   Last Activity: %s\n", project.LastActivity.Format("2006-01-02 15:04"))
+		fmt.Printf("   Last Activity: %s\n", project.LastActivity.Format("Jan 02 15:04 MST"))
 		
 		if i == 0 {
 			// Load sessions for the first project as an example
@@ -87,7 +87,7 @@ func runDebugMode(projects []models.Project) error {
 					break
 				}
 				fmt.Printf("   - %s (Session: %s)\n", 
-					session.LastActivity.Format("2006-01-02 15:04"),
+					session.LastActivity.Format("Jan 02 15:04 MST"),
 					session.SessionID)
 			}
 		}

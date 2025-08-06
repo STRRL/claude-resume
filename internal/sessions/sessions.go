@@ -71,10 +71,10 @@ func FetchProjectsWithStats() ([]models.Project, error) {
 			project.Name = filepath.Base(project.Path)
 		}
 		
-		// Parse timestamp
+		// Parse timestamp and convert to local time
 		if lastActivity.Valid {
 			if t, err := time.Parse(time.RFC3339, lastActivity.String); err == nil {
-				project.LastActivity = t
+				project.LastActivity = t.Local()
 			} else {
 				project.LastActivity = time.Now()
 			}
@@ -307,10 +307,10 @@ func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 		
 		session.ProjectPath = projectPath
 		
-		// Parse timestamp
+		// Parse timestamp and convert to local time
 		if lastActivity.Valid {
 			if t, err := time.Parse(time.RFC3339, lastActivity.String); err == nil {
-				session.LastActivity = t
+				session.LastActivity = t.Local()
 			} else {
 				session.LastActivity = time.Now()
 			}
