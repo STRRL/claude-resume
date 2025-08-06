@@ -307,7 +307,7 @@ func (m model) renderMessages() string {
 		Bold(true).
 		Foreground(lipgloss.Color("229"))
 	
-	s.WriteString(headerStyle.Render("Recent Messages") + "\n")
+	s.WriteString(headerStyle.Render("Conversation") + "\n")
 	dividerWidth := m.rightViewport.Width - 2
 	if dividerWidth < 10 {
 		dividerWidth = 10
@@ -322,28 +322,79 @@ func (m model) renderMessages() string {
 		return s.String()
 	}
 	
-	// Display messages
-	messageStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252"))
-	
+	// Display messages with role-based styling
 	for i, msg := range m.currentMessages {
-		// Message number
-		numStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("243")).
-			Bold(true)
-		s.WriteString(numStyle.Render(fmt.Sprintf("%d. ", i+1)))
-		
-		// Message content (wrap long lines)
-		wrapWidth := m.rightViewport.Width - 5
-		if wrapWidth < 20 {
-			wrapWidth = 20
+		// Check if this is the omitted messages indicator
+		if strings.HasPrefix(msg, "... (") && strings.Contains(msg, "messages omitted)") {
+			// Style the omitted indicator specially
+			omittedStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("238")).
+				Italic(true)
+			s.WriteString("\n" + omittedStyle.Render(msg) + "\n\n")
+			continue
 		}
-		lines := wrapText(msg, wrapWidth)
-		for j, line := range lines {
-			if j > 0 {
-				s.WriteString("   ") // Indent continuation lines
+		
+		// Determine role and style
+		var roleStyle, contentStyle lipgloss.Style
+		
+		if strings.HasPrefix(msg, "[User]") {
+			roleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("39")).
+				Bold(true)
+			contentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+		} else if strings.HasPrefix(msg, "[Assistant]") {
+			roleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("213")).
+				Bold(true)
+			contentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250"))
+		} else {
+			roleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243"))
+			contentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("248"))
+		}
+		
+		// Split role and content
+		parts := strings.SplitN(msg, "] ", 2)
+		if len(parts) == 2 {
+			role := parts[0] + "]"
+			content := parts[1]
+			
+			// Render role
+			s.WriteString(roleStyle.Render(role) + " ")
+			
+			// Render content with wrapping
+			wrapWidth := m.rightViewport.Width - len(role) - 2
+			if wrapWidth < 30 {
+				wrapWidth = 30
 			}
-			s.WriteString(messageStyle.Render(line) + "\n")
+			
+			// Special handling for tool calls
+			if strings.Contains(content, "🔧") {
+				// Tool calls get special coloring
+				toolStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Color("220"))
+				s.WriteString(toolStyle.Render(content) + "\n")
+			} else if strings.Contains(content, "↩") {
+				// Tool results get dimmer coloring
+				resultStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Color("240"))
+				s.WriteString(resultStyle.Render(content) + "\n")
+			} else {
+				// Regular text content
+				lines := wrapText(content, wrapWidth)
+				for j, line := range lines {
+					if j > 0 {
+						s.WriteString(strings.Repeat(" ", len(role)+1)) // Indent continuation
+					}
+					s.WriteString(contentStyle.Render(line) + "\n")
+				}
+			}
+		} else {
+			// Fallback for messages without clear role
+			s.WriteString(contentStyle.Render(msg) + "\n")
 		}
 		
 		if i < len(m.currentMessages)-1 {

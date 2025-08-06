@@ -182,7 +182,7 @@ func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 	return sessions, nil
 }
 
-// FetchRecentMessagesForSession fetches the last 5 user text messages for a session
+// FetchRecentMessagesForSession fetches the first 10 and last 10 messages for a session
 func FetchRecentMessagesForSession(sessionID string) ([]string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -198,27 +198,35 @@ func FetchRecentMessagesForSession(sessionID string) ([]string, error) {
 	}
 	// Don't close the singleton connection
 
-	// Optimized SQL query:
-	// 1. Filter by sessionId and type='user' at the database level
-	// 2. Order by timestamp to get most recent messages
-	// 3. Use a subquery to reverse order for final output
-	// 4. Fetch more than 5 to account for tool results, but limit to reasonable amount
+	// Fetch first 10 and last 10 messages for a complete conversation view
 	messagesQuery := fmt.Sprintf(`
-		SELECT message_json FROM (
+		WITH all_messages AS (
 			SELECT 
+				type,
 				to_json(message) as message_json,
-				timestamp
+				timestamp,
+				ROW_NUMBER() OVER (ORDER BY timestamp ASC) as row_num_asc,
+				ROW_NUMBER() OVER (ORDER BY timestamp DESC) as row_num_desc,
+				COUNT(*) OVER () as total_count
 			FROM read_json('%s',
 				format = 'newline_delimited',
 				union_by_name = true,
 				filename = true
 			)
 			WHERE CAST(sessionId AS VARCHAR) = ?
-			AND type = 'user'
+			AND type IN ('user', 'assistant')
 			AND message IS NOT NULL
-			ORDER BY timestamp DESC
-			LIMIT 30
-		) AS recent_messages
+		)
+		SELECT 
+			type,
+			message_json,
+			CASE 
+				WHEN row_num_asc <= 10 THEN 'first'
+				WHEN row_num_desc <= 10 THEN 'last'
+			END as position,
+			total_count
+		FROM all_messages
+		WHERE row_num_asc <= 10 OR row_num_desc <= 10
 		ORDER BY timestamp ASC
 	`, globPattern)
 
@@ -229,26 +237,60 @@ func FetchRecentMessagesForSession(sessionID string) ([]string, error) {
 	defer rows.Close()
 
 	var messages []string
+	var firstMessages []string
+	var lastMessages []string
+	var totalCount int64
+	lastPosition := ""
+	
 	for rows.Next() {
+		var messageType sql.NullString
 		var messageJSON sql.NullString
-		if err := rows.Scan(&messageJSON); err != nil {
+		var position sql.NullString
+		var count sql.NullInt64
+		
+		if err := rows.Scan(&messageType, &messageJSON, &position, &count); err != nil {
 			continue
 		}
 		
-		if messageJSON.Valid && messageJSON.String != "" {
-			// Extract content from the message JSON in Go
-			content := extractMessageContent(messageJSON.String)
-			// Add the extracted content only if it's actual user text
-			if content != "" {
-				messages = append(messages, strings.TrimSpace(content))
-				// Stop after we have 5 actual text messages
-				if len(messages) >= 5 {
-					break
+		if count.Valid {
+			totalCount = count.Int64
+		}
+		
+		if messageJSON.Valid && messageJSON.String != "" && messageType.Valid && position.Valid {
+			// Extract and format message with role
+			formattedMsg := formatMessageWithRole(messageType.String, messageJSON.String)
+			if formattedMsg != "" {
+				if position.String == "first" {
+					firstMessages = append(firstMessages, formattedMsg)
+					lastPosition = "first"
+				} else if position.String == "last" {
+					// Only add to last messages if we've transitioned from first
+					if lastPosition == "first" && len(lastMessages) == 0 {
+						// Add separator if there are middle messages that were skipped
+						if totalCount > 20 {
+							messages = append(messages, firstMessages...)
+							messages = append(messages, fmt.Sprintf("... (%d messages omitted) ...", totalCount-20))
+							lastMessages = append(lastMessages, formattedMsg)
+						} else {
+							// No middle messages, just combine
+							firstMessages = append(firstMessages, formattedMsg)
+						}
+					} else {
+						lastMessages = append(lastMessages, formattedMsg)
+					}
+					lastPosition = "last"
 				}
 			}
 		}
 	}
-
+	
+	// Combine the messages
+	if len(lastMessages) > 0 {
+		messages = append(messages, lastMessages...)
+	} else {
+		messages = firstMessages
+	}
+	
 	return messages, nil
 }
 
@@ -334,6 +376,128 @@ func extractMessageContent(messageStr string) string {
 	
 	// Return empty string to skip this message
 	return ""
+}
+
+// formatMessageWithRole formats a message with its role and truncated content
+func formatMessageWithRole(messageType, messageStr string) string {
+	// First, check if it's a JSON string that needs to be unescaped
+	if strings.HasPrefix(messageStr, `"`) && strings.HasSuffix(messageStr, `"`) {
+		var unquoted string
+		if err := json.Unmarshal([]byte(messageStr), &unquoted); err == nil {
+			messageStr = unquoted
+		}
+	}
+	
+	// Try to parse as message object
+	var message map[string]interface{}
+	if err := json.Unmarshal([]byte(messageStr), &message); err != nil {
+		return ""
+	}
+	
+	// Get the content field
+	contentRaw, ok := message["content"]
+	if !ok {
+		return ""
+	}
+	
+	// Format based on message type
+	rolePrefix := ""
+	switch messageType {
+	case "user":
+		rolePrefix = "[User] "
+	case "assistant":
+		rolePrefix = "[Assistant] "
+	default:
+		rolePrefix = fmt.Sprintf("[%s] ", messageType)
+	}
+	
+	// Handle different content formats
+	switch content := contentRaw.(type) {
+	case string:
+		// Simple string content - truncate to 50 chars
+		truncated := truncateString(content, 50)
+		return rolePrefix + truncated
+		
+	case []interface{}:
+		// Array of content items - could be text or tool use
+		var result []string
+		
+		for _, item := range content {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				// Check type field
+				if typeStr, ok := itemMap["type"].(string); ok {
+					switch typeStr {
+					case "text":
+						// Text message
+						if text, ok := itemMap["text"].(string); ok && text != "" {
+							// Skip system reminders
+							if !strings.Contains(text, "system-reminder") {
+								truncated := truncateString(text, 50)
+								result = append(result, truncated)
+							}
+						}
+						
+					case "tool_use":
+						// Tool call from assistant
+						toolName := "unknown"
+						if name, ok := itemMap["name"].(string); ok {
+							toolName = name
+						}
+						
+						// Get truncated input
+						inputStr := ""
+						if input, ok := itemMap["input"].(map[string]interface{}); ok {
+							// Try to get a summary of the input
+							if cmd, ok := input["command"].(string); ok {
+								inputStr = truncateString(cmd, 30)
+							} else if path, ok := input["file_path"].(string); ok {
+								inputStr = filepath.Base(path)
+							} else if pattern, ok := input["pattern"].(string); ok {
+								inputStr = truncateString(pattern, 20)
+							} else {
+								// Generic truncation of input
+								inputBytes, _ := json.Marshal(input)
+								inputStr = truncateString(string(inputBytes), 30)
+							}
+						}
+						
+						if inputStr != "" {
+							result = append(result, fmt.Sprintf("🔧 %s: %s", toolName, inputStr))
+						} else {
+							result = append(result, fmt.Sprintf("🔧 %s", toolName))
+						}
+						
+					case "tool_result":
+						// Tool result from user
+						if content, ok := itemMap["content"].(string); ok {
+							// Show truncated tool result
+							truncated := truncateString(content, 40)
+							result = append(result, fmt.Sprintf("↩ %s", truncated))
+						}
+					}
+				}
+			}
+		}
+		
+		if len(result) > 0 {
+			return rolePrefix + strings.Join(result, " | ")
+		}
+	}
+	
+	return ""
+}
+
+// truncateString truncates a string to maxLen characters
+func truncateString(s string, maxLen int) string {
+	// Remove newlines and excessive whitespace
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // ExecuteClaudeResume changes to project directory and executes claude --resume
