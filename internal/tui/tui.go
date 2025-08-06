@@ -189,10 +189,16 @@ func (m *model) updateViewport() {
 func (m *model) loadCurrentSessionMessages() {
 	if m.selectedProject == nil || m.sessionCursor >= len(m.selectedProject.Sessions) {
 		m.currentMessages = []string{}
+		m.selectedSession = nil
 		return
 	}
 	
 	session := m.selectedProject.Sessions[m.sessionCursor]
+	// Fetch summary for this session if not already loaded
+	if session.Summary == "" {
+		session.Summary = sessions.FetchSummaryForSession(session.SessionID)
+	}
+	m.selectedSession = &session
 	messages, err := sessions.FetchRecentMessagesForSession(session.SessionID)
 	if err != nil {
 		m.currentMessages = []string{fmt.Sprintf("Error loading messages: %v", err)}
@@ -224,7 +230,7 @@ func (m model) renderProjects() string {
 			style = style.Foreground(lipgloss.Color("212")).Bold(true)
 		}
 		
-		line := fmt.Sprintf("%s%s (%d sessions) - %s",
+		line := fmt.Sprintf("%s%s (%d sessions) - Last Active: %s",
 			cursor,
 			project.Name,
 			project.SessionCount,
@@ -262,26 +268,58 @@ func (m model) renderSessionsList() string {
 			cursor = "> "
 		}
 		
-		// Date and time
-		dateStyle := lipgloss.NewStyle()
+		// Summary line (always show, use "No Summary" if empty)
+		summaryStyle := lipgloss.NewStyle()
 		if i == m.sessionCursor {
-			dateStyle = dateStyle.Foreground(lipgloss.Color("212")).Bold(true)
+			summaryStyle = summaryStyle.Foreground(lipgloss.Color("212")).Bold(true)
 		} else {
-			dateStyle = dateStyle.Foreground(lipgloss.Color("252"))
+			summaryStyle = summaryStyle.Foreground(lipgloss.Color("250"))
 		}
 		
-		line := fmt.Sprintf("%s%s",
-			cursor,
-			session.LastActivity.Format("01-02 15:04"))
+		// Get summary text or default
+		summaryText := session.Summary
+		if summaryText == "" {
+			summaryText = "No Summary"
+			if i != m.sessionCursor {
+				summaryStyle = summaryStyle.Foreground(lipgloss.Color("238")).Italic(true)
+			} else {
+				summaryStyle = summaryStyle.Foreground(lipgloss.Color("245")).Italic(true)
+			}
+		}
 		
-		s.WriteString(dateStyle.Render(line) + "\n")
+		// Add [Resumed] prefix if this session was resumed
+		if session.IsResumed {
+			summaryText = "[Resumed] " + summaryText
+		}
 		
-		// Session ID (truncated)
+		// Truncate summary to fit in the left panel
+		maxWidth := m.leftViewport.Width - 4
+		if maxWidth < 20 {
+			maxWidth = 20
+		}
+		if len(summaryText) > maxWidth {
+			summaryText = summaryText[:maxWidth-3] + "..."
+		}
+		summaryLine := fmt.Sprintf("%s%s", cursor, summaryText)
+		s.WriteString(summaryStyle.Render(summaryLine) + "\n")
+		
+		// Date and time with "Last Active" label
+		dateStyle := lipgloss.NewStyle()
+		if i == m.sessionCursor {
+			dateStyle = dateStyle.Foreground(lipgloss.Color("245"))
+		} else {
+			dateStyle = dateStyle.Foreground(lipgloss.Color("240"))
+		}
+		
+		dateLine := fmt.Sprintf("  Last Active: %s", session.LastActivity.Format("01-02 15:04"))
+		s.WriteString(dateStyle.Render(dateLine) + "\n")
+		
+		// Session ID (smaller, tertiary info)
 		sessionIDStyle := lipgloss.NewStyle()
 		if i == m.sessionCursor {
-			sessionIDStyle = sessionIDStyle.Foreground(lipgloss.Color("245"))
-		} else {
 			sessionIDStyle = sessionIDStyle.Foreground(lipgloss.Color("238"))
+		} else {
+			sessionIDStyle = sessionIDStyle.Foreground(lipgloss.Color("235"))
 		}
 		
 		truncatedID := session.SessionID
@@ -298,6 +336,7 @@ func (m model) renderSessionsList() string {
 	
 	return s.String()
 }
+
 
 func (m model) renderMessages() string {
 	var s strings.Builder

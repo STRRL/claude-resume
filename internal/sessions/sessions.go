@@ -88,6 +88,106 @@ func FetchProjectsWithStats() ([]models.Project, error) {
 	return projects, nil
 }
 
+// batchFetchSummaries fetches summaries for multiple sessions in batch
+func batchFetchSummaries(sessionIDs []string, globPattern string, database *sql.DB) map[string]string {
+	summaries := make(map[string]string)
+	
+	if len(sessionIDs) == 0 {
+		return summaries
+	}
+	
+	// Build placeholders for IN clause
+	placeholders := make([]string, len(sessionIDs))
+	args := make([]interface{}, len(sessionIDs))
+	for i, id := range sessionIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	
+	// Query 1: Get last UUID for each session
+	lastUuidsQuery := fmt.Sprintf(`
+		WITH last_events AS (
+			SELECT 
+				CAST(sessionId AS VARCHAR) as session_id,
+				CAST(uuid AS VARCHAR) as uuid_str,
+				ROW_NUMBER() OVER (PARTITION BY sessionId ORDER BY timestamp DESC) as rn
+			FROM read_json('%s',
+				format = 'newline_delimited',
+				union_by_name = true,
+				filename = true
+			)
+			WHERE CAST(sessionId AS VARCHAR) IN (%s)
+			AND type <> 'summary'
+		)
+		SELECT session_id, uuid_str
+		FROM last_events
+		WHERE rn = 1
+	`, globPattern, strings.Join(placeholders, ","))
+	
+	rows, err := database.Query(lastUuidsQuery, args...)
+	if err != nil {
+		return summaries
+	}
+	defer rows.Close()
+	
+	sessionUuids := make(map[string]string)
+	for rows.Next() {
+		var sessionID, uuid string
+		if err := rows.Scan(&sessionID, &uuid); err == nil {
+			sessionUuids[sessionID] = uuid
+		}
+	}
+	
+	if len(sessionUuids) == 0 {
+		return summaries
+	}
+	
+	// Query 2: Get summaries for those UUIDs
+	uuids := make([]string, 0, len(sessionUuids))
+	uuidToSession := make(map[string]string)
+	for sessionID, uuid := range sessionUuids {
+		uuids = append(uuids, uuid)
+		uuidToSession[uuid] = sessionID
+	}
+	
+	placeholders2 := make([]string, len(uuids))
+	args2 := make([]interface{}, len(uuids))
+	for i, uuid := range uuids {
+		placeholders2[i] = "?"
+		args2[i] = uuid
+	}
+	
+	summariesQuery := fmt.Sprintf(`
+		SELECT 
+			CAST(leafUuid AS VARCHAR) as leaf_uuid,
+			summary
+		FROM read_json('%s',
+			format = 'newline_delimited',
+			union_by_name = true,
+			filename = true
+		)
+		WHERE type = 'summary'
+		AND CAST(leafUuid AS VARCHAR) IN (%s)
+	`, globPattern, strings.Join(placeholders2, ","))
+	
+	rows2, err := database.Query(summariesQuery, args2...)
+	if err != nil {
+		return summaries
+	}
+	defer rows2.Close()
+	
+	for rows2.Next() {
+		var leafUuid, summary string
+		if err := rows2.Scan(&leafUuid, &summary); err == nil {
+			if sessionID, ok := uuidToSession[leafUuid]; ok {
+				summaries[sessionID] = summary
+			}
+		}
+	}
+	
+	return summaries
+}
+
 // FetchSessionsForProject fetches all sessions for a specific project
 func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 	homeDir, err := os.UserHomeDir()
@@ -104,49 +204,86 @@ func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 	}
 	// Don't close the singleton connection
 
-	// Optimized query to get sessions for a specific project
-	// Direct aggregation without CTE for better performance
+	// Query to get sessions with resume status
 	var sessionsQuery string
 	if projectPath == "Unknown" {
 		// Special case for sessions without a cwd
 		sessionsQuery = fmt.Sprintf(`
-			SELECT 
-				CAST(sessionId AS VARCHAR) as session_id,
-				MAX(timestamp) as last_activity
-			FROM read_json('%s',
-				format = 'newline_delimited',
-				union_by_name = true,
-				filename = true
+			WITH first_events AS (
+				SELECT 
+					CAST(sessionId AS VARCHAR) as session_id,
+					parentUuid,
+					timestamp,
+					ROW_NUMBER() OVER (PARTITION BY sessionId ORDER BY timestamp ASC) as rn
+				FROM read_json('%s',
+					format = 'newline_delimited',
+					union_by_name = true,
+					filename = true
+				)
+				WHERE sessionId IS NOT NULL
+				AND (cwd IS NULL OR cwd = '')
 			)
-			WHERE sessionId IS NOT NULL
-			AND (cwd IS NULL OR cwd = '')
-			GROUP BY sessionId
-			ORDER BY MAX(timestamp) DESC
+			SELECT 
+				fe.session_id,
+				MAX(e.timestamp) as last_activity,
+				CASE WHEN MIN(CASE WHEN fe.rn = 1 THEN fe.parentUuid END) IS NULL THEN false ELSE true END as is_resumed
+			FROM first_events fe
+			JOIN (
+				SELECT CAST(sessionId AS VARCHAR) as session_id, timestamp
+				FROM read_json('%s',
+					format = 'newline_delimited',
+					union_by_name = true,
+					filename = true
+				)
+				WHERE sessionId IS NOT NULL
+				AND (cwd IS NULL OR cwd = '')
+			) e ON e.session_id = fe.session_id
+			GROUP BY fe.session_id
+			ORDER BY MAX(e.timestamp) DESC
 			LIMIT 100
-		`, globPattern)
+		`, globPattern, globPattern)
 	} else {
 		sessionsQuery = fmt.Sprintf(`
-			SELECT 
-				CAST(sessionId AS VARCHAR) as session_id,
-				MAX(timestamp) as last_activity
-			FROM read_json('%s',
-				format = 'newline_delimited',
-				union_by_name = true,
-				filename = true
+			WITH first_events AS (
+				SELECT 
+					CAST(sessionId AS VARCHAR) as session_id,
+					parentUuid,
+					timestamp,
+					ROW_NUMBER() OVER (PARTITION BY sessionId ORDER BY timestamp ASC) as rn
+				FROM read_json('%s',
+					format = 'newline_delimited',
+					union_by_name = true,
+					filename = true
+				)
+				WHERE sessionId IS NOT NULL
+				AND cwd = ?
 			)
-			WHERE sessionId IS NOT NULL
-			AND cwd = ?
-			GROUP BY sessionId
-			ORDER BY MAX(timestamp) DESC
+			SELECT 
+				fe.session_id,
+				MAX(e.timestamp) as last_activity,
+				CASE WHEN MIN(CASE WHEN fe.rn = 1 THEN fe.parentUuid END) IS NULL THEN false ELSE true END as is_resumed
+			FROM first_events fe
+			JOIN (
+				SELECT CAST(sessionId AS VARCHAR) as session_id, timestamp
+				FROM read_json('%s',
+					format = 'newline_delimited',
+					union_by_name = true,
+					filename = true
+				)
+				WHERE sessionId IS NOT NULL
+				AND cwd = ?
+			) e ON e.session_id = fe.session_id
+			GROUP BY fe.session_id
+			ORDER BY MAX(e.timestamp) DESC
 			LIMIT 100
-		`, globPattern)
+		`, globPattern, globPattern)
 	}
 
 	var rows *sql.Rows
 	if projectPath == "Unknown" {
 		rows, err = database.Query(sessionsQuery)
 	} else {
-		rows, err = database.Query(sessionsQuery, projectPath)
+		rows, err = database.Query(sessionsQuery, projectPath, projectPath)
 	}
 	
 	if err != nil {
@@ -155,13 +292,18 @@ func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 	defer rows.Close()
 
 	var sessions []models.Session
+	sessionIDs := []string{}
+	
 	for rows.Next() {
 		var session models.Session
 		var lastActivity sql.NullString
+		var isResumed bool
 		
-		if err := rows.Scan(&session.SessionID, &lastActivity); err != nil {
+		if err := rows.Scan(&session.SessionID, &lastActivity, &isResumed); err != nil {
 			continue
 		}
+		
+		session.IsResumed = isResumed
 		
 		session.ProjectPath = projectPath
 		
@@ -177,9 +319,82 @@ func FetchSessionsForProject(projectPath string) ([]models.Session, error) {
 		}
 		
 		sessions = append(sessions, session)
+		sessionIDs = append(sessionIDs, session.SessionID)
+	}
+	
+	// Batch fetch summaries for all sessions
+	if len(sessionIDs) > 0 {
+		summaries := batchFetchSummaries(sessionIDs, globPattern, database)
+		for i := range sessions {
+			if summary, ok := summaries[sessions[i].SessionID]; ok {
+				sessions[i].Summary = summary
+			}
+		}
 	}
 	
 	return sessions, nil
+}
+
+// FetchSummaryForSession fetches the summary for a specific session
+func FetchSummaryForSession(sessionID string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	claudeDir := filepath.Join(homeDir, ".claude", "projects")
+	globPattern := filepath.Join(claudeDir, "**", "*.jsonl")
+
+	database, err := db.GetDB()
+	if err != nil {
+		return ""
+	}
+
+	// First query: Find the last UUID for this session
+	lastUuidQuery := fmt.Sprintf(`
+		SELECT 
+			CAST(uuid AS VARCHAR) as uuid_str
+		FROM read_json('%s',
+			format = 'newline_delimited',
+			union_by_name = true,
+			filename = true
+		)
+		WHERE CAST(sessionId AS VARCHAR) = ?
+		AND type <> 'summary'
+		ORDER BY timestamp DESC
+		LIMIT 1
+	`, globPattern)
+
+	var lastUuid string
+	uuidRow := database.QueryRow(lastUuidQuery, sessionID)
+	var uuidVal sql.NullString
+	if err := uuidRow.Scan(&uuidVal); err == nil && uuidVal.Valid {
+		lastUuid = uuidVal.String
+	}
+
+	// Second query: Find summary with matching leafUuid if we have a lastUuid
+	if lastUuid != "" {
+		summaryQuery := fmt.Sprintf(`
+			SELECT 
+				summary
+			FROM read_json('%s',
+				format = 'newline_delimited',
+				union_by_name = true,
+				filename = true
+			)
+			WHERE type = 'summary'
+			AND CAST(leafUuid AS VARCHAR) = ?
+			LIMIT 1
+		`, globPattern)
+
+		summaryRow := database.QueryRow(summaryQuery, lastUuid)
+		var summary sql.NullString
+		if err := summaryRow.Scan(&summary); err == nil && summary.Valid {
+			return summary.String
+		}
+	}
+
+	return ""
 }
 
 // FetchRecentMessagesForSession fetches the first 10 and last 10 messages for a session
@@ -453,8 +668,14 @@ func ExecuteClaudeResume(sessionID string, projectPath string) error {
 	return cmd.Run()
 }
 
+// SessionDebugInfo contains debug information about a session
+type SessionDebugInfo struct {
+	Summary  string
+	Messages []string
+}
+
 // DebugSessionMessages returns debug information about messages in a session
-func DebugSessionMessages(sessionID string) ([]string, error) {
+func DebugSessionMessages(sessionID string) (*SessionDebugInfo, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
@@ -469,7 +690,55 @@ func DebugSessionMessages(sessionID string) ([]string, error) {
 	}
 	// Don't close the singleton connection
 
-	// First, let's find any actual user text messages
+	debugInfo := &SessionDebugInfo{
+		Messages: []string{},
+	}
+
+	// First query: Find the last UUID for this session
+	lastUuidQuery := fmt.Sprintf(`
+		SELECT 
+			CAST(uuid AS VARCHAR) as uuid_str
+		FROM read_json('%s',
+			format = 'newline_delimited',
+			union_by_name = true,
+			filename = true
+		)
+		WHERE CAST(sessionId AS VARCHAR) = ?
+		AND type <> 'summary'
+		ORDER BY timestamp DESC
+		LIMIT 1
+	`, globPattern)
+
+	var lastUuid string
+	uuidRow := database.QueryRow(lastUuidQuery, sessionID)
+	var uuidVal sql.NullString
+	if err := uuidRow.Scan(&uuidVal); err == nil && uuidVal.Valid {
+		lastUuid = uuidVal.String
+	}
+
+	// Second query: Find summary with matching leafUuid if we have a lastUuid
+	if lastUuid != "" {
+		summaryQuery := fmt.Sprintf(`
+			SELECT 
+				summary
+			FROM read_json('%s',
+				format = 'newline_delimited',
+				union_by_name = true,
+				filename = true
+			)
+			WHERE type = 'summary'
+			AND CAST(leafUuid AS VARCHAR) = ?
+			LIMIT 1
+		`, globPattern)
+
+		summaryRow := database.QueryRow(summaryQuery, lastUuid)
+		var summary sql.NullString
+		if err := summaryRow.Scan(&summary); err == nil && summary.Valid {
+			debugInfo.Summary = summary.String
+		}
+	}
+
+	// Then, let's find any actual user text messages
 	textQuery := fmt.Sprintf(`
 		SELECT 
 			type,
@@ -491,7 +760,6 @@ func DebugSessionMessages(sessionID string) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var messages []string
 	userMsgCount := 0
 	for rows.Next() {
 		var eventType sql.NullString
@@ -515,13 +783,13 @@ func DebugSessionMessages(sessionID string) ([]string, error) {
 								if text, ok := itemMap["text"].(string); ok {
 									msg := fmt.Sprintf("User Message %d (text) at %s:\n%s", 
 										userMsgCount, timestamp.String, text)
-									messages = append(messages, msg)
+									debugInfo.Messages = append(debugInfo.Messages, msg)
 								}
 							} else if typeStr == "tool_result" {
 								// This is a tool result, skip for now but count it
 								msg := fmt.Sprintf("User Message %d (tool_result) at %s: [Tool Result]", 
 									userMsgCount, timestamp.String)
-								messages = append(messages, msg)
+								debugInfo.Messages = append(debugInfo.Messages, msg)
 							}
 						}
 					}
@@ -529,15 +797,15 @@ func DebugSessionMessages(sessionID string) ([]string, error) {
 					// Direct string content
 					msg := fmt.Sprintf("User Message %d (string) at %s:\n%s", 
 						userMsgCount, timestamp.String, content)
-					messages = append(messages, msg)
+					debugInfo.Messages = append(debugInfo.Messages, msg)
 				}
 			}
 		}
 	}
 
-	if len(messages) == 0 {
-		messages = append(messages, fmt.Sprintf("Found %d user events but no text messages", userMsgCount))
+	if len(debugInfo.Messages) == 0 && userMsgCount > 0 {
+		debugInfo.Messages = append(debugInfo.Messages, fmt.Sprintf("Found %d user events but no text messages", userMsgCount))
 	}
 
-	return messages, nil
+	return debugInfo, nil
 }

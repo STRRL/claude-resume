@@ -24,16 +24,27 @@ func runDebugSession(cmd *cobra.Command, args []string) error {
 	fmt.Println("==========================================")
 	
 	// Try to fetch raw data about this session
-	messages, err := sessions.DebugSessionMessages(sessionID)
+	debugInfo, err := sessions.DebugSessionMessages(sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to debug session: %w", err)
 	}
 	
-	if len(messages) == 0 {
+	// Display summary if available
+	if debugInfo.Summary != "" {
+		fmt.Println("\n=== SESSION SUMMARY ===")
+		fmt.Printf("%s\n", debugInfo.Summary)
+		fmt.Println("=======================")
+	} else {
+		fmt.Println("\n=== NO SUMMARY AVAILABLE ===")
+	}
+	
+	// Display messages
+	fmt.Println("\n=== MESSAGES ===")
+	if len(debugInfo.Messages) == 0 {
 		fmt.Println("No messages found for this session")
 	} else {
-		fmt.Printf("Found %d messages:\n", len(messages))
-		for i, msg := range messages {
+		fmt.Printf("Found %d messages:\n", len(debugInfo.Messages))
+		for i, msg := range debugInfo.Messages {
 			fmt.Printf("\n--- Message %d ---\n%s\n", i+1, msg)
 		}
 	}
