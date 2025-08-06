@@ -26,8 +26,13 @@ type model struct {
 	selectedProject *models.Project
 	selectedSession *models.Session
 	viewport        viewport.Model
+	leftViewport    viewport.Model  // For sessions list in split view
+	rightViewport   viewport.Model  // For messages preview in split view
+	currentMessages []string        // Cache for current session messages
 	ready           bool
 	err             error
+	width           int
+	height          int
 }
 
 func initialModel(projects []models.Project) model {
@@ -49,15 +54,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-3) // Leave room for header and footer
-			m.viewport.YPosition = 0
+			// Initialize viewports
+			m.viewport = viewport.New(msg.Width, msg.Height-3) // For project view
+			
+			// For session view: split screen
+			leftWidth := msg.Width / 2 - 1
+			rightWidth := msg.Width - leftWidth - 1
+			viewHeight := msg.Height - 3
+			
+			m.leftViewport = viewport.New(leftWidth, viewHeight)
+			m.rightViewport = viewport.New(rightWidth, viewHeight)
+			
 			m.ready = true
-			// Initialize content after viewport is ready
 			m.updateViewport()
 		} else {
+			// Resize viewports
 			m.viewport.Width = msg.Width
 			m.viewport.Height = msg.Height - 3
+			
+			leftWidth := msg.Width / 2 - 1
+			rightWidth := msg.Width - leftWidth - 1
+			viewHeight := msg.Height - 3
+			
+			m.leftViewport.Width = leftWidth
+			m.leftViewport.Height = viewHeight
+			m.rightViewport.Width = rightWidth
+			m.rightViewport.Height = viewHeight
+			
 			m.updateViewport()
 		}
 
@@ -75,6 +102,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if m.sessionCursor > 0 {
 					m.sessionCursor--
+					m.loadCurrentSessionMessages()
 					m.updateViewport()
 				}
 			}
@@ -88,6 +116,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				if m.selectedProject != nil && m.sessionCursor < len(m.selectedProject.Sessions)-1 {
 					m.sessionCursor++
+					m.loadCurrentSessionMessages()
 					m.updateViewport()
 				}
 			}
@@ -106,6 +135,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedProject = &project
 					m.currentMode = sessionView
 					m.sessionCursor = 0
+					// Load messages for the first session
+					m.loadCurrentSessionMessages()
 					m.updateViewport()
 				}
 			} else {
@@ -127,16 +158,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Handle viewport updates
-	var cmd tea.Cmd
-	m.viewport, cmd = m.viewport.Update(msg)
-	cmds = append(cmds, cmd)
+	if m.currentMode == projectView {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else {
+		// Update both viewports in session view
+		var leftCmd, rightCmd tea.Cmd
+		m.leftViewport, leftCmd = m.leftViewport.Update(msg)
+		m.rightViewport, rightCmd = m.rightViewport.Update(msg)
+		cmds = append(cmds, leftCmd, rightCmd)
+	}
 
 	return m, tea.Batch(cmds...)
 }
 
 func (m *model) updateViewport() {
-	content := m.renderContent()
-	m.viewport.SetContent(content)
+	if m.currentMode == projectView {
+		content := m.renderProjects()
+		m.viewport.SetContent(content)
+	} else {
+		// Split screen for session view
+		leftContent := m.renderSessionsList()
+		rightContent := m.renderMessages()
+		m.leftViewport.SetContent(leftContent)
+		m.rightViewport.SetContent(rightContent)
+	}
+}
+
+func (m *model) loadCurrentSessionMessages() {
+	if m.selectedProject == nil || m.sessionCursor >= len(m.selectedProject.Sessions) {
+		m.currentMessages = []string{}
+		return
+	}
+	
+	session := m.selectedProject.Sessions[m.sessionCursor]
+	messages, err := sessions.FetchRecentMessagesForSession(session.SessionID)
+	if err != nil {
+		m.currentMessages = []string{fmt.Sprintf("Error loading messages: %v", err)}
+	} else if len(messages) == 0 {
+		m.currentMessages = []string{"No messages found for this session"}
+	} else {
+		m.currentMessages = messages
+	}
 }
 
 func (m model) renderContent() string {
@@ -173,13 +237,24 @@ func (m model) renderProjects() string {
 }
 
 func (m model) renderSessions() string {
+	// This is now only used in renderContent for backward compatibility
+	// The actual session view uses renderSessionsList and renderMessages
+	return m.renderSessionsList()
+}
+
+func (m model) renderSessionsList() string {
 	if m.selectedProject == nil {
 		return "No project selected"
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("Sessions for %s:\n", m.selectedProject.Name))
-	s.WriteString(strings.Repeat("─", 50) + "\n\n")
+	
+	// Header for sessions list
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("229"))
+	s.WriteString(headerStyle.Render("Sessions") + "\n")
+	s.WriteString(strings.Repeat("─", m.leftViewport.Width-2) + "\n\n")
 	
 	for i, session := range m.selectedProject.Sessions {
 		cursor := "  "
@@ -187,37 +262,124 @@ func (m model) renderSessions() string {
 			cursor = "> "
 		}
 		
-		style := lipgloss.NewStyle()
+		// Date and time
+		dateStyle := lipgloss.NewStyle()
 		if i == m.sessionCursor {
-			style = style.Foreground(lipgloss.Color("212")).Bold(true)
+			dateStyle = dateStyle.Foreground(lipgloss.Color("212")).Bold(true)
+		} else {
+			dateStyle = dateStyle.Foreground(lipgloss.Color("252"))
 		}
 		
-		line := fmt.Sprintf("%s%s - %s",
+		line := fmt.Sprintf("%s%s",
 			cursor,
-			session.SessionID[:8],
-			session.LastActivity.Format("2006-01-02 15:04"))
+			session.LastActivity.Format("01-02 15:04"))
 		
-		s.WriteString(style.Render(line) + "\n")
+		s.WriteString(dateStyle.Render(line) + "\n")
 		
-		// Show recent messages for the current session
+		// Session ID (truncated)
+		sessionIDStyle := lipgloss.NewStyle()
 		if i == m.sessionCursor {
-			messages, err := sessions.FetchRecentMessagesForSession(session.SessionID)
-			if err == nil && len(messages) > 0 {
-				s.WriteString("  Recent messages:\n")
-				for j, msg := range messages {
-					if j >= 5 {
-						break
-					}
-					truncatedMsg := truncate(msg, 50)
-					s.WriteString(fmt.Sprintf("    • %s\n", truncatedMsg))
-				}
-			}
+			sessionIDStyle = sessionIDStyle.Foreground(lipgloss.Color("245"))
+		} else {
+			sessionIDStyle = sessionIDStyle.Foreground(lipgloss.Color("238"))
 		}
 		
-		s.WriteString("\n")
+		truncatedID := session.SessionID
+		if len(truncatedID) > 12 {
+			truncatedID = truncatedID[:12] + "..."
+		}
+		sessionIDLine := fmt.Sprintf("  %s", truncatedID)
+		s.WriteString(sessionIDStyle.Render(sessionIDLine) + "\n")
+		
+		if i < len(m.selectedProject.Sessions)-1 {
+			s.WriteString("\n")
+		}
 	}
 	
 	return s.String()
+}
+
+func (m model) renderMessages() string {
+	var s strings.Builder
+	
+	// Header
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("229"))
+	
+	s.WriteString(headerStyle.Render("Recent Messages") + "\n")
+	dividerWidth := m.rightViewport.Width - 2
+	if dividerWidth < 10 {
+		dividerWidth = 10
+	}
+	s.WriteString(strings.Repeat("─", dividerWidth) + "\n\n")
+	
+	if len(m.currentMessages) == 0 {
+		emptyStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Italic(true)
+		s.WriteString(emptyStyle.Render("No messages found"))
+		return s.String()
+	}
+	
+	// Display messages
+	messageStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252"))
+	
+	for i, msg := range m.currentMessages {
+		// Message number
+		numStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243")).
+			Bold(true)
+		s.WriteString(numStyle.Render(fmt.Sprintf("%d. ", i+1)))
+		
+		// Message content (wrap long lines)
+		wrapWidth := m.rightViewport.Width - 5
+		if wrapWidth < 20 {
+			wrapWidth = 20
+		}
+		lines := wrapText(msg, wrapWidth)
+		for j, line := range lines {
+			if j > 0 {
+				s.WriteString("   ") // Indent continuation lines
+			}
+			s.WriteString(messageStyle.Render(line) + "\n")
+		}
+		
+		if i < len(m.currentMessages)-1 {
+			s.WriteString("\n")
+		}
+	}
+	
+	return s.String()
+}
+
+// wrapText wraps text to fit within the specified width
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	
+	var lines []string
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return []string{text}
+	}
+	
+	currentLine := words[0]
+	for _, word := range words[1:] {
+		if len(currentLine)+1+len(word) > width {
+			lines = append(lines, currentLine)
+			currentLine = word
+		} else {
+			currentLine += " " + word
+		}
+	}
+	if currentLine != "" {
+		lines = append(lines, currentLine)
+	}
+	
+	return lines
 }
 
 func (m model) View() string {
@@ -232,7 +394,47 @@ func (m model) View() string {
 	header := m.renderHeader()
 	footer := m.renderFooter()
 	
-	return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), footer)
+	if m.currentMode == projectView {
+		return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), footer)
+	} else {
+		// Split screen view for sessions
+		return fmt.Sprintf("%s\n%s\n%s", header, m.renderSplitView(), footer)
+	}
+}
+
+func (m model) renderSplitView() string {
+	// Use lipgloss to properly handle the layout
+	leftStyle := lipgloss.NewStyle().
+		Width(m.leftViewport.Width).
+		Height(m.leftViewport.Height)
+	
+	rightStyle := lipgloss.NewStyle().
+		Width(m.rightViewport.Width).
+		Height(m.rightViewport.Height)
+	
+	dividerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("238")).
+		Height(m.leftViewport.Height)
+	
+	leftContent := leftStyle.Render(m.leftViewport.View())
+	rightContent := rightStyle.Render(m.rightViewport.View())
+	
+	// Create the divider
+	divider := strings.Builder{}
+	for i := 0; i < m.leftViewport.Height; i++ {
+		divider.WriteString("│")
+		if i < m.leftViewport.Height-1 {
+			divider.WriteString("\n")
+		}
+	}
+	
+	// Join the views horizontally
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		leftContent,
+		dividerStyle.Render(divider.String()),
+		rightContent,
+	)
 }
 
 func (m model) renderHeader() string {
