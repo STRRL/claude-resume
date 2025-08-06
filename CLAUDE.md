@@ -111,3 +111,21 @@ For message parsing:
 - SQL window functions used for efficient first/last message selection
 - Queries limit results to prevent overwhelming the UI (100 projects, 100 sessions per project)
 - Singleton DuckDB connection pattern prevents connection overhead
+
+## IMPORTANT: Git Commit Policy
+
+⚠️ **NEVER EXECUTE GIT COMMIT COMMANDS UNLESS EXPLICITLY REQUESTED** ⚠️
+
+Claude Code MUST NOT run any git commit commands automatically or proactively. Git commits should only be created when the user explicitly asks for them using phrases like:
+- "commit these changes"
+- "create a commit"
+- "git commit"
+- "please commit"
+
+This ensures that:
+- Users maintain full control over their git history
+- No unwanted commits are created
+- Users can review all changes before committing
+- Commit messages can be properly crafted when requested
+
+If changes need to be saved but no commit was requested, simply inform the user that the changes have been made to the files without creating a commit.
