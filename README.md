@@ -4,17 +4,29 @@ An interactive TUI (Terminal User Interface) tool for browsing and resuming Clau
 
 ![Screenshot](./static/Screenshot%202025-08-05%20at%2023.18.48.png)
 
-## Features
+## Features: claude-resume vs `claude -r`
 
-- **Project Browser**: View all projects with Claude Code sessions, session counts, and last activity timestamps
-- **Split-Screen Session View**: Browse sessions on the left while previewing conversation messages on the right
-- **Smart Message Display**: Shows first 10 and last 10 messages with automatic truncation and omission indicators
-- **Rich Message Formatting**: 
+### Why claude-resume?
+
+While `claude -r` shows only recent sessions from the current directory, **claude-resume** provides a comprehensive, multi-project view with conversation previews:
+
+| Feature | `claude -r` (built-in) | **claude-resume** |
+|---------|------------------------|-------------------|
+| **Project Scope** | Current directory only | All projects at once |
+| **Session Info** | Title and timestamp only | Title, timestamp, plus key messages |
+| **Message Context** | Must resume to see | See first/last 10 messages instantly |
+
+### Key Advantages
+
+- **Global Project Overview**: Browse all your Claude Code projects in one place, with session counts and last activity for each
+- **Conversation Preview**: See actual conversation content before resuming - including user messages, assistant responses, and tool calls
+- **Smart Message Display**: Intelligently shows the most relevant parts (first 10 and last 10 messages) with clear omission indicators
+- **Rich Formatting**: 
   - Role-based color coding (User/Assistant)
   - Tool call visualization with icons (🔧 for calls, ↩ for results)
   - Intelligent 50-character truncation for readability
-- **Instant Session Resume**: Resume any session with a single keystroke
-- **Clean Terminal UI**: Proper viewport scrolling and responsive layout
+- **Efficient Session Discovery**: Find the right session faster by seeing actual conversation content, not just titles
+- **Clean Terminal UI**: Sophisticated split-screen interface with proper viewport scrolling
 
 ## Installation
 
